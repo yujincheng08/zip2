@@ -48,6 +48,7 @@ zstd = { version = "0.13.1", optional = true, default-features = false }
 zopfli = { version = "0.8.1", optional = true }
 deflate64 = { version = "0.1.8", optional = true }
 lzma-rs = { version = "0.3.0", default-features = false, optional = true }
+lzma-rust = { git="https://github.com/dyz1990/sevenz-rust.git", rev="86e6db2f87239386ec3f31c277495ee5fe32cf7b", default-features = false, optional = true }
 
 [target.'cfg(any(all(target_arch = "arm", target_pointer_width = "32"), target_arch = "mips", target_arch = "powerpc"))'.dependencies]
 crossbeam-utils = "0.8.20"
@@ -78,7 +79,7 @@ deflate-zlib-ng = ["flate2/zlib-ng", "deflate-flate2"]
 deflate-zopfli = ["zopfli", "_deflate-any"]
 lzma = ["lzma-rs/stream"]
 unreserved = []
-xz = ["lzma-rs/raw_decoder"]
+xz = ["lzma-rust"]
 default = [
     "aes-crypto",
     "bzip2",

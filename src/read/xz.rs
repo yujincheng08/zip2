@@ -1,81 +1,80 @@
 use crc32fast::Hasher;
-use lzma_rs::decompress::raw::Lzma2Decoder;
+use lzma_rust::LZMA2Reader;
 use std::{
-    collections::VecDeque,
-    io::{BufRead, BufReader, Error, Read, Result, Write},
+    cell::RefCell, io::{Error, Read, Result}, rc::Rc
 };
 
-#[derive(Debug)]
-pub struct XzDecoder<R> {
-    compressed_reader: BufReader<R>,
-    stream_size: usize,
-    buf: VecDeque<u8>,
-    check_size: usize,
-    records: Vec<(usize, usize)>,
+struct RcCountReader<R: Read> {
+    inner: Rc<RefCell<R>>,
+    count: Rc<RefCell<usize>>,
+}
+
+enum XzReader<R: Read> {
+    RawReader(RcCountReader<R>),
+    LzmaReader(LZMA2Reader<RcCountReader<R>>),
+}
+
+pub struct XzDecoder<R: Read> {
+    compressed_reader: XzReader<R>,
     flags: [u8; 2],
+    block_begin: usize,
+    block_written: usize,
+    records: Vec<(usize, usize)>,
 }
 
 impl<R: Read> XzDecoder<R> {
     pub fn new(inner: R) -> Self {
         XzDecoder {
-            compressed_reader: BufReader::new(inner),
-            stream_size: 0,
-            buf: VecDeque::new(),
-            check_size: 0,
-            records: vec![],
+            compressed_reader: XzReader::RawReader(RcCountReader::new(inner)),
             flags: [0, 0],
+            block_begin: 0,
+            block_written: 0,
+            records: vec![],
         }
     }
 }
 
-struct CountReader<'a, R: BufRead> {
-    inner: &'a mut R,
-    count: &'a mut usize,
+impl<R: Read> RcCountReader<R> {
+    fn new(inner: R) -> Self {
+        RcCountReader {
+            inner: Rc::new(RefCell::new(inner)),
+            count: Rc::new(RefCell::new(0)),
+        }
+    }
+
+    fn count(&self) -> usize {
+        *self.count.borrow()
+    }
+
+    fn reset_count(&self) {
+        *self.count.borrow_mut() = 0;
+    }
 }
 
-impl<R: BufRead> Read for CountReader<'_, R> {
+impl<R: Read> Read for RcCountReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let count = self.inner.read(buf)?;
-        *self.count += count;
+        let count = self.inner.borrow_mut().read(buf)?;
+        *self.count.borrow_mut() += count;
         Ok(count)
     }
 }
 
-impl<R: BufRead> BufRead for CountReader<'_, R> {
-    fn fill_buf(&mut self) -> Result<&[u8]> {
-        self.inner.fill_buf()
-    }
-
-    fn consume(&mut self, amt: usize) {
-        self.inner.consume(amt);
-        *self.count += amt;
-    }
-}
-
-struct BufWriter<'a> {
-    inner: &'a mut [u8],
-    written: &'a mut usize,
-    total: &'a mut usize,
-    rest: &'a mut VecDeque<u8>,
-}
-
-impl<'a> Write for BufWriter<'a> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        if self.inner.len() > *self.written {
-            let len = std::cmp::min(buf.len(), self.inner.len() - *self.written);
-            self.inner[*self.written..*self.written + len].copy_from_slice(&buf[..len]);
-            *self.written += len;
-            *self.total += len;
-            Ok(len)
-        } else {
-            self.rest.extend(buf.iter());
-            *self.total += buf.len();
-            Ok(buf.len())
+impl<R: Read> Clone for RcCountReader<R> {
+    fn clone(&self) -> Self {
+        RcCountReader {
+            inner: Rc::clone(&self.inner),
+            count: Rc::clone(&self.count),
         }
     }
+}
 
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
+impl<R: Read> XzReader<R> {
+    fn into_inner(self) -> Option<R> {
+        let reader = match self {
+            XzReader::RawReader(reader) => reader,
+            XzReader::LzmaReader(reader) => reader.into_inner(),
+        };
+        Rc::into_inner(reader.inner).map(|r| r.into_inner())
     }
 }
 
@@ -99,18 +98,41 @@ fn get_multibyte<R: Read>(input: &mut R, hasher: &mut Hasher) -> Result<u64> {
 }
 
 impl<R: Read> Read for XzDecoder<R> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        if !self.buf.is_empty() {
-            let len = std::cmp::min(buf.len(), self.buf.len());
-            buf[..len].copy_from_slice(&self.buf.as_slices().0[..len]);
-            self.buf.drain(..len);
-            return Ok(len);
+fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if let XzReader::LzmaReader(reader) = &mut self.compressed_reader {
+            match reader.read(buf) {
+                Ok(0) => {
+                    let unpadded_size = reader.get_ref().count() - self.block_begin;
+                    self.records.push((unpadded_size, self.block_written));
+                    // ignore check here since zip itself will check it
+                    let check_size = match self.flags[1] & 0x0F {
+                        0 => 0,
+                        1 => 4,
+                        _ => unreachable!(),
+                    };
+
+                    let mut b = vec![0u8; ((4 - (unpadded_size & 0x3)) & 0x3) + check_size];
+                    reader.read_exact(b.as_mut_slice())?;
+                    if !b.as_slice()[..check_size].iter().all(|&b| b == 0) {
+                        return error("Invalid XZ block padding");
+                    }
+
+                    self.compressed_reader = XzReader::RawReader(reader.get_ref().clone());
+                }
+                Ok(n) => {
+                    self.block_written += n;
+                    return Ok(n);
+                } 
+                Err(e) => return Err(e),
+            }
         }
-        let mut reader = CountReader {
-            inner: &mut self.compressed_reader,
-            count: &mut self.stream_size,
+        let reader = match &mut self.compressed_reader {
+            XzReader::RawReader(reader) => reader,
+            _ => unreachable!(),
         };
-        if *reader.count == 0 {
+
+
+        if reader.count() == 0 {
             let mut b = [0u8; 12];
             match reader.read(&mut b) {
                 Ok(0) => return Ok(0),
@@ -125,8 +147,7 @@ impl<R: Read> Read for XzDecoder<R> {
                 return error("Invalid XZ stream flags");
             }
             match self.flags[1] & 0x0F {
-                0 => self.check_size = 0,
-                1 => self.check_size = 4,
+                0 | 1 => (),
                 _ => return error("Unsupported XZ stream flags"),
             }
             let mut digest = Hasher::new();
@@ -136,7 +157,7 @@ impl<R: Read> Read for XzDecoder<R> {
             }
         }
 
-        let block_begin = *reader.count;
+        self.block_begin = reader.count();
         let mut b = [0u8; 1];
         reader.read_exact(&mut b)?;
 
@@ -144,19 +165,19 @@ impl<R: Read> Read for XzDecoder<R> {
         digest.update(&b);
         if b[0] == 0 {
             // index
-            let num_records = get_multibyte(&mut reader, &mut digest)?;
+            let num_records = get_multibyte(reader, &mut digest)?;
             if num_records != self.records.len() as u64 {
                 return error("Invalid XZ index record count");
             }
             for (unpadded_size, total) in &self.records {
-                if get_multibyte(&mut reader, &mut digest)? != *unpadded_size as u64 {
+                if get_multibyte(reader, &mut digest)? != *unpadded_size as u64 {
                     return error("Invalid XZ unpadded size");
                 }
-                if get_multibyte(&mut reader, &mut digest)? != *total as u64 {
+                if get_multibyte(reader, &mut digest)? != *total as u64 {
                     return error("Invalid XZ uncompressed size");
                 }
             }
-            let mut size = *reader.count - block_begin;
+            let mut size = reader.count() - self.block_begin;
             let mut b = vec![0u8; (4 - (size & 0x3)) & 0x3];
             reader.read_exact(b.as_mut_slice())?;
             if !b.iter().all(|&b| b == 0) {
@@ -183,17 +204,17 @@ impl<R: Read> Read for XzDecoder<R> {
             if &b[14..16] != b"YZ" {
                 return error("Invalid XZ footer magic");
             }
-            let mut b = vec![0u8; (4 - (*reader.count & 0x3)) & 0x3];
+            let mut b = vec![0u8; (4 - (reader.count() & 0x3)) & 0x3];
             reader.read_exact(b.as_mut_slice())?;
             if !b.iter().all(|&b| b == 0) {
                 return error("Invalid XZ footer padding");
             }
-            *reader.count = 0;
+            reader.reset_count();
             return self.read(buf);
         }
 
         // block
-        let header_end = ((b[0] as usize) << 2) - 1 + *reader.count;
+        let header_end = ((b[0] as usize) << 2) - 1 + reader.count();
         let mut b = [0u8; 1];
         reader.read_exact(&mut b)?;
         digest.update(&b);
@@ -204,17 +225,17 @@ impl<R: Read> Read for XzDecoder<R> {
             return error("Invalid XZ block flags");
         }
         if flags & 0x40 != 0 {
-            get_multibyte(&mut reader, &mut digest)?;
+            get_multibyte(reader, &mut digest)?;
         }
         if flags & 0x80 != 0 {
-            get_multibyte(&mut reader, &mut digest)?;
+            get_multibyte(reader, &mut digest)?;
         }
         for _ in 0..num_filters {
-            let filter_id = get_multibyte(&mut reader, &mut digest)?;
+            let filter_id = get_multibyte(reader, &mut digest)?;
             if filter_id != 0x21 {
                 return error("Unsupported XZ filter ID");
             }
-            let properties_size = get_multibyte(&mut reader, &mut digest)?;
+            let properties_size = get_multibyte(reader, &mut digest)?;
             if properties_size != 1 {
                 return error("Unsupported XZ filter properties size");
             }
@@ -224,7 +245,7 @@ impl<R: Read> Read for XzDecoder<R> {
             }
             digest.update(&b);
         }
-        let mut b = vec![0u8; header_end - *reader.count];
+        let mut b = vec![0u8; header_end - reader.count()];
         reader.read_exact(b.as_mut_slice())?;
         if !b.iter().all(|&b| b == 0) {
             return error("Invalid XZ block header padding");
@@ -236,32 +257,18 @@ impl<R: Read> Read for XzDecoder<R> {
         if digest.finalize().to_le_bytes() != b {
             return error("Invalid XZ block header CRC32");
         }
-        let mut written = 0;
-        let mut total = 0;
-        Lzma2Decoder::new().decompress(
-            &mut reader,
-            &mut BufWriter {
-                inner: buf,
-                written: &mut written,
-                rest: &mut self.buf,
-                total: &mut total,
-            },
-        )?;
-
-        let unpadded_size = *reader.count - block_begin;
-        self.records.push((unpadded_size, total));
-        // ignore check here since zip itself will check it
-        let mut b = vec![0u8; ((4 - (unpadded_size & 0x3)) & 0x3) + self.check_size];
-        reader.read_exact(b.as_mut_slice())?;
-        if !b.as_slice()[..self.check_size].iter().all(|&b| b == 0) {
-            return error("Invalid XZ block padding");
-        }
+        self.block_written = 0;
+        let mut reader = LZMA2Reader::new(reader.clone(), 8_388_608u32, None);
+        let written = reader.read(buf)?;
+        self.block_written += written;
+        self.compressed_reader = XzReader::LzmaReader(reader);
         Ok(written)
+
     }
 }
 
 impl<R: Read> XzDecoder<R> {
     pub fn into_inner(self) -> R {
-        self.compressed_reader.into_inner()
+        self.compressed_reader.into_inner().unwrap()
     }
 }

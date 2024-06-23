@@ -13,7 +13,14 @@ fn decompress_xz() -> io::Result<()> {
     assert_eq!("hello.txt", file.name());
 
     let mut content = Vec::new();
-    file.read_to_end(&mut content)?;
+    let mut b = [0u8; 1];
+    loop {
+        let n = file.read(&mut b)?;
+        if n == 0 {
+            break;
+        }
+        content.push(b[0]);
+    }
     assert_eq!("Hello world\n", String::from_utf8(content).unwrap());
     Ok(())
 }
